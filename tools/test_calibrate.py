@@ -73,6 +73,26 @@ class Calibrate(unittest.TestCase):
         d = res["report"]["drift"]["pcie"]
         self.assertGreater(d["end"], d["start"])
 
+    def test_a_disturbed_reading_is_outvoted(self):
+        # everything equal, but the first reading at pcie 0.35 comes from a busy PC: a third reading decides
+        seen = []
+
+        def speed(f, p, w):
+            seen.append(f)
+            return 25.0 if abs(f - 0.35) < 1e-6 and seen.count(0.35) <= 3 else 50.0   # one rate() = 3 prompts
+        res, _ = self.run_with(speed)
+        self.assertEqual(len(res["report"]["pcie_sweep"]["0.35"]), 3)
+        self.assertNotIn("--pcie-frac", res["settings"])
+
+    def test_warm_up_waits_for_the_rate_to_settle(self):
+        calls = [0]
+
+        def speed(f, p, w):
+            calls[0] += 1
+            return 60.0 if calls[0] > 18 else 30.0 + calls[0]      # rising for 6 rounds, then steady
+        eng = FakeEngine(BASE, speed)
+        self.assertEqual(CAL.Session(eng, [[1, 2, 3]] * 3).warm_up(), 8)
+
     def test_probes_past_the_edge(self):
         # faster all the way to pcie 1.0: the grid stops at 0.75, the probing goes on
         res, _ = self.run_with(lambda f, p, w: 50.0 + 20.0 * f)

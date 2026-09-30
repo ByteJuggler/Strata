@@ -36,7 +36,9 @@ PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75)
 PCIE_BEYOND = ((0.9, 1.0), ())     # probed only while the best so far sits on that edge (up, down)
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
 SPEC_MIN_P_BEYOND = ((0.8, 0.9), (0.2,))
-WARM_UP_ROUNDS = 3
+WARM_UP_MIN, WARM_UP_MAX = 3, 10  # warm-up rounds: at least / at most
+WARM_UP_SETTLED = 0.02             # warmed up once two rounds in a row differ by less than this
+DISAGREE = 0.10                    # a value whose up and down readings differ by more is measured a third time
 MAX_NEW = 128
 PROMPTS = (
     "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two tests.",
@@ -99,7 +101,12 @@ def sweep(rate, grid, beyond, label: str, say=print) -> tuple[dict, dict]:
     last = rate(values[0])
     drift = {"value": values[0], "start": first, "end": last}
     for v in values:
-        say(f"    {label} {v:.2f}: {samples[v][0]:.1f} / {samples[v][1]:.1f} tok/s  (up / down)")
+        a, b = samples[v]
+        note = ""
+        if abs(a - b) > DISAGREE * max(a, b):          # one of the two was disturbed: a third reading outvotes it
+            samples[v].append(rate(v))
+            note = f", again {samples[v][2]:.1f} (they disagreed)"
+        say(f"    {label} {v:.2f}: {a:.1f} / {b:.1f} tok/s  (up / down{note})")
     say(f"    {label} {values[0]:.2f} again: {first:.1f} before the sweep, {last:.1f} after "
         f"({(last / first - 1) * 100 if first else 0:+.1f}% drift)")
     # past the edge: interleave the new value with the current best, so both see the same cache
@@ -141,14 +148,24 @@ class Session:
                 rates.append(n / (ms / 1000.0))
         return statistics.median(rates) if rates else 0.0
 
-    def warm_up(self, rounds: int = 2):
-        for _ in range(rounds):
-            self.rate()
+    def warm_up(self, say=None) -> int:
+        """Run the prompts until the rate settles (the adaptive expert tier and the OS warm up for a while after a
+        start: 3 fixed rounds left the first sweep reading ~15% low).  -> the rounds it took."""
+        prev = None
+        for n in range(1, WARM_UP_MAX + 1):
+            r = self.rate()
+            if n >= WARM_UP_MIN and prev and abs(r - prev) < WARM_UP_SETTLED * prev:
+                break
+            prev = r
+        if say:
+            say(f"    (warmed up in {n} rounds, {r:.1f} tok/s)")
+        return n
 
 
 def run(cfg: dict, say=print, start_engine=None) -> dict:
     """Measure on the engine `cfg` describes; returns {"settings": {flag: value}, "report": {...}}.
     `start_engine(args)` returns a started engine (serve.server.StrataEngine or a stand-in in tests)."""
+    start_engine_given = start_engine is not None
     if start_engine is None:
         from serve.server import StrataEngine, child_env
 
@@ -163,7 +180,19 @@ def run(cfg: dict, say=print, start_engine=None) -> dict:
     tok = ST.Tokenizer(toks, (tpath / "merges.txt").read_text(encoding="utf-8").split("\n"),
                        json.loads((tpath / "token_type.json").read_text()))
     ids_list = [chat_ids(tok, p) for p in PROMPTS]
-    return measure(engine_args(cfg), ids_list, start_engine, say)
+    # the image encoder takes its VRAM before the engine sizes its expert cache (serve/server.py loads it first), so
+    # it runs through the measurements too: without it the tuning measured a ~9% larger cache than the model serves
+    vision = None
+    if cfg.get("vision") and not start_engine_given:
+        from serve.server import Vision, child_env as _env
+        say("  Loading the image encoder (it runs beside the model, so its VRAM is measured too) ...")
+        vision = Vision(cfg["vision"], log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                        env=_env(cfg))
+    try:
+        return measure(engine_args(cfg), ids_list, start_engine, say)
+    finally:
+        if vision is not None:
+            vision.close()
 
 
 def engine_args(cfg: dict) -> list[str]:
@@ -201,7 +230,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
         d_minp = float(info.get("spec_min_p", 0.5))
         d_workers = int(info.get("pool_workers", 0)) or None
         s = Session(eng, ids_list)
-        s.warm_up(WARM_UP_ROUNDS)
+        s.warm_up(say)
         # 1. the PCIe share, at the default draft floor
         by_pcie, pcie_drift = sweep(lambda f: s.rate({"pcie_frac": f, "spec_min_p": d_minp}),
                                     set(PCIE_FRACS) | {round(d_pcie, 2)}, PCIE_BEYOND, "PCIe share", say)
@@ -241,7 +270,7 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
             e = start_engine(with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)))
             try:
                 sw = Session(e, ids_list)
-                sw.warm_up(WARM_UP_ROUNDS)
+                sw.warm_up()
                 by_workers[w] = [sw.rate() for _ in range(3)]
                 say(f"    {w} workers: {statistics.median(by_workers[w]):.1f} tok/s")
             finally:
