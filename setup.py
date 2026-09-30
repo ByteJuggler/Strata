@@ -5515,7 +5515,7 @@ def low_ram_gpu_gb(model, vram_gb, ctx=32768, kv="int8", mtp=True) -> float:
     """About how many GB of the model's experts the GPU's cache holds: its VRAM minus ~5 GB for the dense weights,
     buffers and a 32K context's KV cache, minus the KV cache of a longer context (in VRAM in the low-RAM mode: its RAM
     has no room for KV streaming), minus ~1 GB for the draft layer (MTP) when it is on."""
-    kv_tok = 13 * KV_CELL_BYTES.get(kv, 1056)           # bytes per context token: 12 QSA layers + the draft layer
+    kv_tok = kv_token_bytes(kv)
     longer = max(0, ctx - 32768) * kv_tok / 1e9
     return max(0.0, min(MODELS[model]["arena_gb"], vram_gb - 5 - (MTP_VRAM_GB if mtp else 0.0) - longer))
 
@@ -5553,7 +5553,7 @@ def low_ram_wanted(model, ram, choice="auto") -> bool:
 def kv_streaming_ram_gb(ctx, kv) -> float:
     """The RAM a streamed KV cache takes: ~13.7 KB per context token with 8-bit KV (1.7 GB at 128K), 10.6 KB with
     K8V4, 7.5 KB with 4-bit - 12 QSA layers + the draft layer."""
-    return ctx * (13 * KV_CELL_BYTES.get(kv, 1056)) / 1e9
+    return ctx * kv_token_bytes(kv) / 1e9
 
 
 def kv_streaming_wanted(model, ctx, kv, ram, choice="auto") -> bool:
@@ -5718,21 +5718,28 @@ def confirm_paging(model, ram, choice, yes, explicit_model=False):
                                                                           " (--model)" if explicit_model else ""))
 
 
-def ctx_ram_need(model, ctx, low_ram=False):
+def kv_token_bytes(kv: str) -> int:
+    """Bytes of KV cache per context token: 12 QSA layers + the draft layer, at 1056 B/cell for 8-bit, 576 for 4-bit
+    and 816 for the K8V4 hybrid (PR #120)."""
+    return 13 * KV_CELL_BYTES.get(kv, 1056)
+
+
+def ctx_ram_need(model, ctx, low_ram=False, kv="int8"):
     """#406: the RAM (GB) setup estimates for a long context with IQ3_XXS / IQ3_S: their experts + the context's
-    8-bit KV cache + 24 GB of room for everything else (the 0.1.29 arithmetic, counted).  None where the context does
-    not count against RAM by this rule: the other sizes, and the low-RAM mode (its KV cache stays in VRAM)."""
+    KV cache at the precision chosen (8-bit when not known yet: the most it can be) + 24 GB of room for everything
+    else (the 0.1.29 arithmetic, counted).  None where the context does not count against RAM by this rule: the other
+    sizes, and the low-RAM mode (its KV cache stays in VRAM)."""
     if model not in ("IQ3_XXS", "IQ3_S") or low_ram:
         return None
-    return MODELS[model]["arena_gb"] + ctx * 13 * 1056 / 1e9 + 24
+    return MODELS[model]["arena_gb"] + ctx * kv_token_bytes(kv) / 1e9 + 24
 
 
-def ram_ctx(model, ram, low_ram=False) -> int:
+def ram_ctx(model, ram, low_ram=False, kv="int8") -> int:
     """#406: the longest context the RAM rule recommends: 128K, or longer where the estimate fits this PC's RAM.  It
     is part of the recommended default (the smaller of it and the GPU's rule); a longer choice is kept, with a note.
     The 200K menu step is never the recommendation (#608)."""
     # 204800 (#608) is a menu step between 128K and 256K, never the recommendation: where 256K does not fit, 128K stays
-    return max(c for c in CONTEXTS if c <= 131072 or (c != 204800 and (ctx_ram_need(model, c, low_ram) or 0) <= ram))
+    return max(c for c in CONTEXTS if c <= 131072 or (c != 204800 and (ctx_ram_need(model, c, low_ram, kv) or 0) <= ram))
 
 
 def app_settings_file() -> Path | None:
@@ -6250,7 +6257,7 @@ def choices_from_config(cfg_path: Path) -> dict:
     esp_path = esp.rsplit(":", 1)[0] if esp else None
     return {"family": family, "model": model if model in MODELS else None,
             "context": int(val("--max-context")) if val("--max-context") else None,
-            "kv": val("--kv") if val("--kv") in ("int8", "q4_0") else None,
+            "kv": val("--kv") if val("--kv") in ("int8", "q4_0", "k8v4") else None,
             "vision": ("gpu" if vis.get("gpu") else "cpu") if isinstance(vis, dict) else "none",
             "esp": ("on" if Path(esp_path).name == ESP_VECTOR.name else esp_path) if esp_path else "off",
             "host": cfg.get("host"), "api_key": cfg.get("api_key"), "port": cfg.get("port"), "gpu": cfg.get("gpu"),
@@ -8431,7 +8438,7 @@ def main() -> int:
     if budget is not None:                             # UD-Q4_K_XL: every GB of KV is a GB fewer of cached experts
         rec_ctx = 8192 if small < 14 else 32768
     # #406: the RAM rule is part of the recommendation (the smaller of the two), no longer a cap over the user's choice
-    rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram))
+    rec_ctx = min(rec_ctx, ram_ctx(model, ram, low_ram, a.kv or "int8"))
     if a.context:
         ctx = a.context
     else:
@@ -8439,7 +8446,7 @@ def main() -> int:
         say("  Context length = how much text the model can see at once (your chat, files, tool output).")
         say("  Longer needs more VRAM for it, so fewer experts fit on the GPU:")
         for i, c in enumerate(CONTEXTS, 1):
-            need_c = ctx_ram_need(model, c, low_ram)
+            need_c = ctx_ram_need(model, c, low_ram, a.kv or "int8")
             note = ("   (recommended for your GPU)" if c == rec_ctx else "") + \
                    ("   (experimental: setup adds rope scaling)" if c > 262144 else "") + \
                    (f"   (needs ~{need_c:.0f} GB RAM, this PC has {ram:.0f}: may run out of memory)"
@@ -8449,7 +8456,7 @@ def main() -> int:
                                str(CONTEXTS.index(rec_ctx) + 1), a.yes)) - 1]
     # #406 #364: a context past the RAM rule (an explicit --context, a pick in the list, or the earlier install's) is
     # kept, with what it risks.  It used to become 128K: users ran 256K fine where setup's estimate said no.
-    need_gb = ctx_ram_need(model, ctx, low_ram)
+    need_gb = ctx_ram_need(model, ctx, low_ram, a.kv or "int8")
     if need_gb is not None and ram < need_gb and ctx > 131072:
         warn(f"{ctx // 1024}K with {model} needs ~{need_gb:.0f} GB of RAM by setup's estimate "
              f"({MODELS[model]['arena_gb']:.0f} GB of experts + the context + room for the rest); this PC has "
@@ -8484,7 +8491,8 @@ def main() -> int:
         say("             documents; long-context lookups (needle tests) still pass")
         kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
     if ctx > 8192:
-        ok(f"KV cache: {'8-bit' if kv == 'int8' else '4-bit (Hadamard-rotated)'}")
+        ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
+                           "k8v4": "8-bit K + 4-bit V (hybrid)"}.get(kv, kv))
     if MODELS[model].get("vision", fam.get("vision")) is False:     # UD-IQ4_XS: images, unlike UD-Q4_K_XL
         vision = "none"
         if a.vision not in (None, "no", "none"):
