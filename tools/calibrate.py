@@ -11,8 +11,10 @@ measured on (a Ryzen 5 7600 + RTX 5070 on PCIe 5):
 The first two are measured through one engine (per-request `strata_tune` keys); the worker count needs a restart
 per value.  Decode speed only: the prompt path streams every expert whatever these settings say.
 
-A setting is kept only when it beats the default by more than MIN_GAIN in an interleaved re-measurement - the
-adaptive expert tier and the OS make single measurements noisy by a few percent.
+The adaptive expert tier keeps warming up while one engine measures, so each sweep runs up and back down (a linear
+drift cancels) and reports the drift it saw.  A value past a grid's edge is tried while the best sits on that edge,
+and the probing stops at the first one that does not beat the best by MIN_GAIN.  The fastest measured setting wins
+(the default only on a tie); the PCIe/draft pair is re-measured against the default interleaved before it counts.
 
     python tools/calibrate.py strata-q2_0.json        # measure and print; setup.py --calibrate also saves it
 """
@@ -29,9 +31,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(ROOT))
 
-MIN_GAIN = 0.03                    # a setting must beat the default by this much to be kept
+MIN_GAIN = 0.03                    # a value past the grid's edge must beat the best by this much to probe further
 PCIE_FRACS = (0.0, 0.2, 0.35, 0.55, 0.75)
+PCIE_BEYOND = ((0.9, 1.0), ())     # probed only while the best so far sits on that edge (up, down)
 SPEC_MIN_PS = (0.3, 0.5, 0.7)
+SPEC_MIN_P_BEYOND = ((0.8, 0.9), (0.2,))
+WARM_UP_ROUNDS = 3
 MAX_NEW = 128
 PROMPTS = (
     "Write a Python function that merges two sorted lists into one sorted list, with a docstring and two tests.",
@@ -69,13 +74,52 @@ def worker_candidates(default: int) -> list[int]:
     return c
 
 
-def pick(measured: dict, default_key, min_gain: float = MIN_GAIN):
-    """The key with the best median tok/s, or `default_key` unless the best beats it by more than min_gain."""
+def pick(measured: dict, default_key, min_gain: float = 0.0):
+    """The key with the best median tok/s; `default_key` on a tie, or unless the best beats it by more than min_gain."""
     med = {k: statistics.median(v) for k, v in measured.items() if v}
     if not med or default_key not in med:
         return default_key
     best = max(med, key=med.get)
     return best if med[best] > med[default_key] * (1.0 + min_gain) else default_key
+
+
+def sweep(rate, grid, beyond, label: str, say=print) -> tuple[dict, dict]:
+    """Measure `rate(value)` over `grid`, then past its edges while the best sits on one.  -> (samples, drift).
+
+    One engine measures every value, and its expert cache keeps adapting to the prompts, so a plain ascending pass
+    credits the later (higher) values with the warm-up.  Every value is measured once ascending and once
+    descending, which cancels a linear drift, and the first value is measured again at the end: `drift` reports
+    how much faster the same setting got meanwhile, which is the warm-up the old one-pass sweep mistook for a gain.
+    """
+    values = sorted(grid)
+    samples: dict = {v: [] for v in values}
+    first = rate(values[0])
+    for v in values + values[::-1]:
+        samples[v].append(rate(v))
+    last = rate(values[0])
+    drift = {"value": values[0], "start": first, "end": last}
+    for v in values:
+        say(f"    {label} {v:.2f}: {samples[v][0]:.1f} / {samples[v][1]:.1f} tok/s  (up / down)")
+    say(f"    {label} {values[0]:.2f} again: {first:.1f} before the sweep, {last:.1f} after "
+        f"({(last / first - 1) * 100 if first else 0:+.1f}% drift)")
+    # past the edge: interleave the new value with the current best, so both see the same cache
+    up, down = (list(b) for b in beyond)
+    while True:
+        med = {k: statistics.median(s) for k, s in samples.items()}
+        best = max(med, key=med.get)
+        side = up if best == max(samples) and up else down if best == min(samples) and down else None
+        if side is None:
+            break
+        v = side.pop(0)
+        samples[v] = []
+        for _ in range(2):
+            samples[v].append(rate(v))
+            samples[best].append(rate(best))
+        say(f"    {label} {v:.2f}: {statistics.median(samples[v]):.1f} tok/s  (past the edge; "
+            f"{best:.2f} meanwhile {statistics.median(samples[best][-2:]):.1f})")
+        if statistics.median(samples[v]) <= statistics.median(samples[best][-2:]) * (1.0 + MIN_GAIN):
+            break                                      # no clear gain past the edge: stop, the best found stands
+    return samples, drift
 
 
 class Session:
@@ -157,30 +201,29 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
         d_minp = float(info.get("spec_min_p", 0.5))
         d_workers = int(info.get("pool_workers", 0)) or None
         s = Session(eng, ids_list)
-        s.warm_up()
+        s.warm_up(WARM_UP_ROUNDS)
         # 1. the PCIe share, at the default draft floor
-        by_pcie = {}
-        for f in sorted(set(PCIE_FRACS) | {round(d_pcie, 2)}):
-            by_pcie[f] = [s.rate({"pcie_frac": f, "spec_min_p": d_minp})]
-            say(f"    PCIe share {f:.2f}: {by_pcie[f][0]:.1f} tok/s")
-        best_pcie = max(by_pcie, key=lambda k: by_pcie[k][0])
+        by_pcie, pcie_drift = sweep(lambda f: s.rate({"pcie_frac": f, "spec_min_p": d_minp}),
+                                    set(PCIE_FRACS) | {round(d_pcie, 2)}, PCIE_BEYOND, "PCIe share", say)
+        best_pcie = max(by_pcie, key=lambda k: statistics.median(by_pcie[k]))
         # 2. the draft floor, at that share
-        by_minp = {}
-        for p in sorted(set(SPEC_MIN_PS) | {round(d_minp, 2)}):
-            by_minp[p] = [s.rate({"pcie_frac": best_pcie, "spec_min_p": p})]
-            say(f"    draft floor {p:.2f}: {by_minp[p][0]:.1f} tok/s")
-        best_minp = max(by_minp, key=lambda k: by_minp[k][0])
-        # 3. the winner against the default, interleaved, three times each
+        by_minp, minp_drift = sweep(lambda p: s.rate({"pcie_frac": best_pcie, "spec_min_p": p}),
+                                    set(SPEC_MIN_PS) | {round(d_minp, 2)}, SPEC_MIN_P_BEYOND, "draft floor", say)
+        best_minp = max(by_minp, key=lambda k: statistics.median(by_minp[k]))
+        # 3. the winner against the default, interleaved in alternating order, three times each; the faster one wins
         dflt, cand = (round(d_pcie, 2), round(d_minp, 2)), (best_pcie, best_minp)
         confirm = {dflt: [], cand: []}
         if cand != dflt:
-            for _ in range(3):
-                for k in (dflt, cand):
+            for i in range(3):
+                for k in ((dflt, cand) if i % 2 == 0 else (cand, dflt)):
                     confirm[k].append(s.rate({"pcie_frac": k[0], "spec_min_p": k[1]}))
+            say(f"    default {dflt[0]:.2f}/{dflt[1]:.2f}: {statistics.median(confirm[dflt]):.1f} tok/s, "
+                f"best {cand[0]:.2f}/{cand[1]:.2f}: {statistics.median(confirm[cand]):.1f} tok/s  (interleaved, 3 each)")
         chosen = pick(confirm, dflt) if cand != dflt else dflt
         report.update(default={"pcie_frac": dflt[0], "spec_min_p": dflt[1], "pool_workers": d_workers},
                       pcie_sweep={str(k): v for k, v in by_pcie.items()},
                       min_p_sweep={str(k): v for k, v in by_minp.items()},
+                      drift={"pcie": pcie_drift, "min_p": minp_drift},
                       confirm={f"{k[0]}/{k[1]}": v for k, v in confirm.items()})
     finally:
         close(eng)
@@ -198,8 +241,8 @@ def measure(base_args: list[str], ids_list, start_engine, say=print) -> dict:
             e = start_engine(with_arg(tuned, "--pool-workers", None if w == d_workers else str(w)))
             try:
                 sw = Session(e, ids_list)
-                sw.warm_up(1)
-                by_workers[w] = [sw.rate(), sw.rate()]
+                sw.warm_up(WARM_UP_ROUNDS)
+                by_workers[w] = [sw.rate() for _ in range(3)]
                 say(f"    {w} workers: {statistics.median(by_workers[w]):.1f} tok/s")
             finally:
                 close(e)

@@ -54,10 +54,42 @@ class Calibrate(unittest.TestCase):
         res, _ = self.run_with(lambda f, p, w: 50.0)
         self.assertEqual(res["settings"], {})
 
-    def test_small_gain_is_noise(self):
-        # 2% better at pcie 0.35: below MIN_GAIN, so the default stays
+    def test_small_gain_still_wins(self):
+        # 2% better at pcie 0.35 in every measurement: the fastest setting is taken, however small the margin
         res, _ = self.run_with(lambda f, p, w: 51.0 if abs(f - 0.35) < 1e-6 else 50.0)
-        self.assertEqual(res["settings"], {})
+        self.assertEqual(res["settings"].get("--pcie-frac"), "0.35")
+
+    def test_warm_up_drift_is_not_a_gain(self):
+        # every setting equally fast, but each measurement 0.5% faster than the one before (the cache warming up):
+        # the old ascending sweep picked the last values; the up-and-down sweep keeps the defaults
+        calls = [0]
+
+        def speed(f, p, w):
+            calls[0] += 1
+            return 50.0 * (1.0 + 0.005 * calls[0])
+        res, _ = self.run_with(speed)
+        self.assertNotIn("--pcie-frac", res["settings"])
+        self.assertNotIn("--spec-min-p", res["settings"])
+        d = res["report"]["drift"]["pcie"]
+        self.assertGreater(d["end"], d["start"])
+
+    def test_probes_past_the_edge(self):
+        # faster all the way to pcie 1.0: the grid stops at 0.75, the probing goes on
+        res, _ = self.run_with(lambda f, p, w: 50.0 + 20.0 * f)
+        self.assertEqual(res["settings"].get("--pcie-frac"), "1.00")
+        self.assertIn("1.0", res["report"]["pcie_sweep"])
+
+    def test_probing_stops_without_a_clear_gain(self):
+        # 0.9 is only 1% better than 0.75: taken as the best, but 1.0 is never tried
+        res, _ = self.run_with(lambda f, p, w: 50.0 + 5.0 * min(f, 0.75) + (0.6 if f >= 0.9 else 0.0))
+        self.assertEqual(res["settings"].get("--pcie-frac"), "0.90")
+        self.assertNotIn("1.0", res["report"]["pcie_sweep"])
+
+    def test_draft_floor_probes_both_edges(self):
+        res, _ = self.run_with(lambda f, p, w: 50.0 + 20.0 * p)
+        self.assertEqual(res["settings"].get("--spec-min-p"), "0.90")
+        res, _ = self.run_with(lambda f, p, w: 70.0 - 20.0 * p)
+        self.assertEqual(res["settings"].get("--spec-min-p"), "0.20")
 
     def test_finds_pcie_and_min_p(self):
         def speed(f, p, w):
@@ -147,7 +179,9 @@ class Calibrate(unittest.TestCase):
 
     def test_pick(self):
         self.assertEqual(CAL.pick({"a": [50, 51, 49], "b": [53, 52, 60]}, "a"), "b")
-        self.assertEqual(CAL.pick({"a": [50, 51, 49], "b": [51, 51.5, 51]}, "a"), "a")
+        self.assertEqual(CAL.pick({"a": [50, 51, 49], "b": [51, 51.5, 51]}, "a"), "b")    # the faster one, by any margin
+        self.assertEqual(CAL.pick({"a": [50, 51, 49], "b": [50, 51, 49]}, "a"), "a")      # a tie keeps the default
+        self.assertEqual(CAL.pick({"a": [50], "b": [51]}, "a", min_gain=0.03), "a")
         self.assertEqual(CAL.pick({}, "a"), "a")
 
 
