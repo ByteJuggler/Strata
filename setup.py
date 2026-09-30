@@ -3862,6 +3862,12 @@ def main() -> int:
 
     # ---- 2. the questions
     step(2, "your choices")
+    # Setting up again: every question defaults to what the installed config (the newest) was set up with, so a rerun
+    # to change one thing (--kv k8v4) does not quietly turn images or the projection off, or drop the network settings.
+    # The command line still wins; a new install gets the usual recommendations.
+    prev = choices_from_config(installed_configs()[0]) if installed_configs() else {}
+    a.host, a.api_key, a.port = a.host or prev.get("host"), a.api_key or prev.get("api_key"), a.port or prev.get("port")
+    port = a.port or port
     fams = list(FAMILIES)
     if a.family:
         family = a.family
@@ -3869,7 +3875,8 @@ def main() -> int:
         for i, f in enumerate(fams, 1):
             d = FAMILIES[f]
             say(f"  {i}) {d['title']:20s} {d['by']} - {d['about']}" + ("   [experimental]" if d.get("experimental") else ""))
-        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], "1", a.yes)) - 1]
+        fam_def = str(fams.index(prev["family"]) + 1) if prev.get("family") in fams else "1"
+        family = fams[int(ask("Which model?", [str(i) for i in range(1, len(fams) + 1)], fam_def, a.yes)) - 1]
     fam = FAMILIES[family]
     ok(f"model: {fam['title']}")
     if fam.get("license"):
@@ -3896,6 +3903,8 @@ def main() -> int:
                    + ("the rest in RAM)" if low_ram_resident(m, ram, gpu["vram_gb"]) else "the rest from the SSD)"))
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
     rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 and "IQ3_XXS" in names else "1"
+    if prev.get("family") == family and prev.get("model") in names:
+        rec = str(names.index(prev["model"]) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     budget, q4_split = None, False
     if MODELS[model].get("budget"):
@@ -3943,6 +3952,7 @@ def main() -> int:
     tag = fam["tag"] + model                           # names of the pack, config and start script
     small = min(x["vram_gb"] for x in chosen)         # each card keeps its layers' KV of the whole context
     rec_ctx = 32768 if small < 14 else 65536 if small < 20 else 131072
+    kept_ctx = prev.get("context") if prev.get("context") in CONTEXTS else None
     if budget is not None:                             # UD-Q4_K_XL: every GB of KV is a GB fewer of cached experts
         rec_ctx = 8192 if small < 14 else 32768
     # #406: the RAM rule is part of the recommendation (the smaller of the two), no longer a cap over the user's choice
@@ -3956,12 +3966,13 @@ def main() -> int:
         for i, c in enumerate(CONTEXTS, 1):
             need_c = ctx_ram_need(model, c, low_ram, a.kv or "int8")
             note = ("   (recommended for your GPU)" if c == rec_ctx else "") + \
+                   ("   (your current setting)" if c == kept_ctx and c != rec_ctx else "") + \
                    ("   (experimental: setup adds rope scaling)" if c > 262144 else "") + \
                    (f"   (needs ~{need_c:.0f} GB RAM, this PC has {ram:.0f}: may run out of memory)"
                     if c > 131072 and need_c is not None and need_c > ram else "")
             say(f"  {i}) {c // 1024}K tokens{note}")
         ctx = CONTEXTS[int(ask("Context?", [str(i) for i in range(1, len(CONTEXTS) + 1)],
-                               str(CONTEXTS.index(rec_ctx) + 1), a.yes)) - 1]
+                               str(CONTEXTS.index(kept_ctx or rec_ctx) + 1), a.yes)) - 1]
     # #406 #364: a context past the RAM rule (an explicit --context, a pick in the list, or the earlier install's) is
     # kept, with what it risks.  It used to become 128K: users ran 256K fine where setup's estimate said no.
     need_gb = ctx_ram_need(model, ctx, low_ram, a.kv or "int8")
@@ -3990,14 +4001,16 @@ def main() -> int:
         ok(f"rope scaling: {scaling}, factor {rope_scale:g} ({origin})")
     ok(f"context: {ctx} tokens")
     # the KV cache (the model's memory of the conversation): 8-bit, or 4-bit after a Hadamard rotation (PR #21)
-    kv = "fp16" if ctx <= 8192 else (a.kv or "int8")
+    kv = "fp16" if ctx <= 8192 else (a.kv or prev.get("kv") or "int8")
     if ctx > 8192 and not a.kv and not a.yes:
+        kvs = ["int8", "q4_0", "k8v4"]
         say()
         say("  KV cache precision (the model's memory of the conversation):")
         say("  1) 8-bit   (recommended: what every published number was measured with)")
         say("  2) 4-bit   half the memory (about 4% faster at 128K), but measurably less precise on long")
         say("             documents; long-context lookups (needle tests) still pass")
-        kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
+        say("  3) hybrid  8-bit K + 4-bit V, in between (816 bytes per cell); its KV cache always stays in VRAM")
+        kv = kvs[int(ask("KV cache?", ["1", "2", "3"], str(kvs.index(kv) + 1), a.yes)) - 1]
     if ctx > 8192:
         ok("KV cache: " + {"int8": "8-bit", "q4_0": "4-bit (Hadamard-rotated)",
                            "k8v4": "8-bit K + 4-bit V (hybrid)"}.get(kv, kv))
@@ -4013,7 +4026,9 @@ def main() -> int:
         say()
         say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
         say("  download and keeps ~1.4 GB of VRAM free for the image encoder, so text is a few % slower.")
-        vision = "gpu" if ask("Do you want images?", ["y", "n"], "n", a.yes) == "y" else "none"
+        had = prev.get("vision") not in (None, "none")
+        vision = (prev["vision"] if had else "gpu") if ask("Do you want images?", ["y", "n"], "y" if had else "n",
+                                                          a.yes) == "y" else "none"
     ok("images: " + {"none": "off", "gpu": "on", "cpu": "on (encoder on the CPU)"}[vision])
     # The low-RAM mode's two variants.  resident: the experts the GPU's cache does not hold (and, as far as RAM allows,
     # the ones the prompt path borrows cache room from) are copied from the pack's experts.bin into RAM once, so
@@ -4057,7 +4072,9 @@ def main() -> int:
             say("  It changes how the model answers: its package describes it as a refusal-direction projection (the")
             say("  model declines far fewer requests). Off unless you choose it; when on, the web app can switch it off")
             say("  per chat. Details: data/experimental-speed-projection/README.md")
-            esp_choice = "on" if ask("Turn on the experimental speed projection?", ["y", "n"], "n", a.yes) == "y" else "off"
+            had = prev.get("esp") not in (None, "off")
+            esp_choice = (prev["esp"] if had else "on") if ask("Turn on the experimental speed projection?", ["y", "n"],
+                                                              "y" if had else "n", a.yes) == "y" else "off"
         if esp_choice.lower() not in ("off", "no", "n", "0"):
             esp = ESP_VECTOR if esp_choice.lower() in ("on", "yes", "y", "1") else Path(esp_choice).expanduser().resolve()
             if not esp.is_file():
