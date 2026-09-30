@@ -73,8 +73,10 @@ class CarryOver(unittest.TestCase):
         code, out, cfg, _ = self.run_setup(configs=[("strata-q2_0.json", old)])
         self.assertEqual(code, 0, out)
         self.assertEqual(cfg["model_name"], first["model_name"])
-        self.assertEqual(cfg["port"], first["port"])
-        self.assertNotIn("host", cfg)                                     # as before: --host is given to setup
+        # the network settings are setup's answers too: a re-run defaults to the installed config's, like every
+        # other question, so changing one thing (--kv) does not take the server off the network or drop its key
+        self.assertEqual(cfg["port"], 9999)
+        self.assertEqual(cfg["host"], "0.0.0.0")
         self.assertEqual(cfg["draft_vocab"], "en")                        # kept by its own rule (saved_draft_vocab)
         self.assertNotIn("kept from", out)
 
