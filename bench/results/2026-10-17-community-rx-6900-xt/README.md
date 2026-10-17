@@ -17,7 +17,7 @@ no correctness check was run with this suite.
 - Engine: 0.1.45, the official prebuilt Windows HIP zip (ROCm 10.2.0a20260930).
 - Strata: upstream v0.1.45 (`477ac13c`) plus local, Python-only branches, none of which touch the engine or the
   serving path. The reports show the local merge commit `4ffeff69`. One of those branches is a one-line fix
-  that BENCH needed in order to start a server at all (#2330 removed the `port` variable). That fix is sent separately.
+  that BENCH needed in order to start a server at all (#2330 removed the `port` variable). That fix is #2919.
 - Background load: desktop apps closed; no power limits set.
 
 ## Configuration
