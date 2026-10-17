@@ -76,7 +76,7 @@ and their limits. Report what you actually measured and label estimates separate
 - [2026-10-17: AMD Radeon RX 6900 XT 16 GB (gfx1030), Core i7-5930K without AVX-512, 128 GB DDR4-2400](../bench/results/2026-10-17-community-rx-6900-xt/README.md):
   Strata 0.1.45 prebuilt Windows HIP engine, six models (Flash-Next Q2_0, IQ3_XXS, IQ3_S; Coder IQ1_M; Swift 1.5 IQ2_XS, IQ3_XXS) on one config at 262,144 context
   (`--kv int8 --kv-resident 20480 --prefill 12288`); the standard `BENCH.bat` suite. Chat decode 33.9-50.2 tok/s, 16K prompts 892-1,126 tok/s.
-  Removing the low-RAM leftovers `--resident-experts` (Coder) and `--mmap-experts` (Swift IQ2_XS) on 128 GB: decode +30% / +34%, 16K prompts +17% / +42%.
+  Removing the low-RAM flags `--resident-experts` (Coder) and `--mmap-experts` (Swift IQ2_XS) on 128 GB: decode +30% / +34%, 16K prompts +17% / +42%.
 
 ## Run the standard benchmark
 
