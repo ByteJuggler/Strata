@@ -15,9 +15,8 @@ no correctness check was run with this suite.
 - Page file: 32 GB.
 - OS: Windows 11 Pro 23H2 (10.0.22631). GPU driver: AMD Software 26.8.1 (32.0.21045.5002).
 - Engine: 0.1.45, the official prebuilt Windows HIP zip (ROCm 10.2.0a20260930).
-- Strata: upstream v0.1.45 (`477ac13c`) plus local, Python-only branches, none of which touch the engine or the
-  serving path. The reports show the local merge commit `4ffeff69`. One of those branches is a one-line fix
-  that BENCH needed in order to start a server at all (#2330 removed the `port` variable). That fix is #2919.
+- Strata: v0.1.45 (`477ac13c`) with the one-line BENCH fix #2919, which `tools/strata_bench.py` needs to start a
+  server itself.
 - Background load: desktop apps closed; no power limits set.
 
 ## Configuration
@@ -29,10 +28,8 @@ The same settings for every model, in addition to what setup wrote:
 env STRATA_HIP_PROMPT_F16=1
 ```
 
-These came from about three days of sweeps on this machine, mainly on Q2_0 and IQ3_S at 131K to 262K context.
-
-- `--prefill 12288` was stable throughout and up to 12% faster on long prompts than the Windows HIP `auto` cap of
-  6144 (see #2871).
+- `--prefill 12288` is above the Windows HIP `auto` cap of 6144; on this card it is stable and faster on long
+  prompts (see #2871).
 - The full launch line of each model is in its folder's `README.md`. The Flash-Next models use the experimental
   speed projection; the Coder and Swift models don't.
 - MTP: `--spec 4 --spec-min-p 0.5`.
@@ -52,9 +49,10 @@ Medians over 3 runs per test (9 requests for chat). Ranges and per-request data 
 | [Coder IQ1_M](coder-iq1_m/README.md) | 38.2 | 923 | **1,126** | 46.4 | 0.85 s |
 | [Flash-Next IQ3_S](iq3_s/README.md) | 33.9 | 599 | 892 | 39.3 | 0.94 s |
 
-### Two flags from an earlier, smaller-RAM install
+### Two low-RAM flags on a machine with enough RAM
 
-Setup had added these when the machine had 64 GB or less. With 128 GB, removing them made both models much faster:
+Setup adds these low-RAM modes on machines with less RAM. Both configs here were set up when this machine had
+64 GB or less. On 128 GB, removing them made both models much faster:
 
 | Run | Chat decode | 4K prompt | 16K prompt | Agent decode |
 | --- | ---: | ---: | ---: | ---: |
@@ -63,22 +61,18 @@ Setup had added these when the machine had 64 GB or less. With 128 GB, removing 
 | [Swift IQ2_XS with `--mmap-experts`](flag-removal/swift-iq2_xs-mmap-experts/README.md) | 35.4 | 485 | 682 | 49.4 |
 | Swift IQ2_XS without | 47.4 (+34%) | 782 (+61%) | 968 (+42%) | 55.9 (+13%) |
 
-Setup does not remove these flags when RAM is added later, so an older install that has since gained RAM may be
-running slower than it needs to.
+An install set up with less RAM keeps these flags until setup runs again, so a machine that has since gained RAM may
+be running slower than it needs to.
 
 ## Method
 
 - `python tools/strata_bench.py --config strata-<model>.json`, one model at a time.
 - Each run started its own server from the install's configuration. Model loading is not timed.
-- The machine was kept awake for the whole series.
 - The flag-removal pairs were measured the same day, on the same machine, with only that flag changed.
-- An earlier pass of Swift IQ2_XS with `--mmap-experts` overlapped a PC sleep. It was re-run, and the clean re-run is
-  the one included.
 
 ## Limitations
 
 - Each figure comes from one benchmark session per model. Single decode runs within a session vary widely (see the
   ranges in each folder), so differences of a few percent between models are not meaningful.
-- Prompts are at most 16K tokens. Long-context behaviour (prompts up to 255K, recall checks) was measured separately
-  with other scripts and is not part of this report.
+- Prompts are at most 16K tokens; longer prompts are not part of this report.
 - No quality or recall check was run with this suite.

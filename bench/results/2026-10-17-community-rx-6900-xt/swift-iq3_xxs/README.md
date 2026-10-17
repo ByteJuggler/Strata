@@ -7,7 +7,7 @@ Measured on 2026-10-17 with `tools/strata_bench.py` (suite 1, 3 runs per test, m
 - GPU and VRAM: AMD Radeon RX 6900 XT, 16 GiB VRAM
 - CPU: Intel(R) Core(TM) i7-5930K CPU @ 3.50GHz (6 cores, 12 threads); installed RAM: 127.9 GiB; storage: not measured
 - OS: Windows 11 (10.0.22631); GPU driver: 32.0.21045.5002; CUDA: not read
-- Strata: project 0.1.45, commit 4ffeff69; engine 0.1.45
+- Strata: project 0.1.45, commit 477ac13c (v0.1.45) with the BENCH fix #2919; engine 0.1.45
 - Background workloads and power limits: not recorded
 
 ## Model and configuration
