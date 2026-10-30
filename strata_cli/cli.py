@@ -332,6 +332,9 @@ def parser() -> argparse.ArgumentParser:
     standard.add_argument("--build-options", metavar="LIST", help="comma-separated build options of a source build")
     standard.add_argument("--skip-model-hash", action="store_true",
                           help="do not hash the model files (the run is then marked nonconforming)")
+    standard.add_argument("--reasoning-effort", choices=("low", "medium", "high", "xhigh"), default="xhigh",
+                          help="thinking effort sent with every request (default xhigh, the protocol's); any other "
+                               "marks the run nonconforming, as an operator variant")
     bench_cancel = bench_sp.add_parser("cancel", help="stop the exact active saved-profile benchmark")
     bench_cancel.add_argument("--profile", required=True, help="saved serving profile")
     bench_cancel.add_argument("--path", required=True, help="absolute run directory or results.json")
@@ -1302,7 +1305,8 @@ def _bench_standard(a: argparse.Namespace, machine: bool) -> int:
             doc, out_dir = bench_standard.run(target, out, out_root=out_root, optional_concurrency=a.optional_concurrency,
                                               declared=declared, plan=plan, engine_log=engine_log, command=command, log=log,
                                               engine_run_log=(run_log, log_start) if proc is not None else None,
-                                              started_engine=proc is not None, hash_model=not a.skip_model_hash)
+                                              started_engine=proc is not None, hash_model=not a.skip_model_hash,
+                                              reasoning_effort=a.reasoning_effort)
     finally:
         stop_problem = bench_standard.stop_engine(proc)
         if not isinstance(stop_problem, str):
