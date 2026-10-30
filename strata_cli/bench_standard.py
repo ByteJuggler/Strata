@@ -52,6 +52,10 @@ LENGTH_TOLERANCE = 0.02
 
 SAMPLING = {"temperature": 1.0, "top_p": 0.95, "top_k": 20, "min_p": 0.0, "presence_penalty": 0.0,
             "repetition_penalty": 1.0, "reasoning_effort": "xhigh"}
+#: The efforts `--reasoning-effort` accepts. Only the protocol's own ("xhigh") gives a conforming run; any other one is an
+#: operator variant for "what does a lower effort cost and save", so the result says so (status nonconforming, with the
+#: reason) and its sampling block records the effort that was actually sent. Nothing else of the profile changes.
+REASONING_EFFORTS = ("low", "medium", "high", "xhigh")
 TEMPLATE_KWARGS = {"enable_thinking": True, "preserve_thinking": True}
 PHASES = ("warmup", "performance", "sanity", "concurrency")
 PLANNED = {"warmup": 1, "performance": 9, "sanity": 12, "concurrency": 12}
@@ -167,11 +171,11 @@ class Target:
             conn.close()
 
 
-def payload_of(spec: dict, model: str | None) -> dict:
+def payload_of(spec: dict, model: str | None, sampling: dict = SAMPLING) -> dict:
     """The request body: the protocol's sampling and thinking settings, every one explicit, plus the fixture's messages and tools."""
     body = {"model": model or "strata", "messages": spec["messages"], "stream": True,
             "stream_options": {"include_usage": True}, "max_tokens": spec["max_output_tokens"], "seed": spec["seed"],
-            **SAMPLING, "reasoning_budget_tokens": 0, "chat_template_kwargs": dict(TEMPLATE_KWARGS)}
+            **sampling, "reasoning_budget_tokens": 0, "chat_template_kwargs": dict(TEMPLATE_KWARGS)}
     if spec.get("tools"):
         body["tools"] = spec["tools"]
         body["tool_choice"] = spec.get("tool_choice") or "auto"
@@ -179,9 +183,9 @@ def payload_of(spec: dict, model: str | None) -> dict:
 
 
 def stream_chat(target: Target, spec: dict, model: str | None, *, timeout_s: float,
-                gate: threading.Event | None = None) -> dict:
+                gate: threading.Event | None = None, sampling: dict = SAMPLING) -> dict:
     """Send one streamed request and keep what the client saw, with monotonic offsets from the moment of dispatch."""
-    body = json.dumps(payload_of(spec, model)).encode("utf-8")
+    body = json.dumps(payload_of(spec, model, sampling)).encode("utf-8")
     raw: dict = {"http_status": None, "error": None, "finish_reason": None, "usage": None, "timings": None,
                  "events": [], "reasoning": [], "content": [], "tool_calls": {}, "done": False,
                  "timed_out": False, "interrupted": False}
@@ -370,7 +374,8 @@ def _round(value: float | None) -> float | None:
     return None if value is None else round(value, 6)
 
 
-def record_of(spec: dict, raw: dict, meta: dict, why: facts.Why | None = None) -> tuple[dict, dict, dict]:
+def record_of(spec: dict, raw: dict, meta: dict, why: facts.Why | None = None,
+              sampling: dict = SAMPLING) -> tuple[dict, dict, dict]:
     """-> (the report's request record, evidence for outputs.jsonl, extras for the report's `extensions`)."""
     usage = raw["usage"] if isinstance(raw.get("usage"), dict) else {}
     timings = raw["timings"] if isinstance(raw.get("timings"), dict) else {}
@@ -458,7 +463,7 @@ def record_of(spec: dict, raw: dict, meta: dict, why: facts.Why | None = None) -
                                                abs(input_tokens - spec["target_input_tokens"]) >
                                                LENGTH_TOLERANCE * spec["target_input_tokens"])}
     evidence = {"request_id": spec["id"], "phase": spec["phase"], "case_id": spec["case_id"],
-                "request": {k: v for k, v in payload_of(spec, None).items() if k not in ("messages", "tools", "model")},
+                "request": {k: v for k, v in payload_of(spec, None, sampling).items() if k not in ("messages", "tools", "model")},
                 "messages": spec["messages"], "tools": spec.get("tools"),
                 "final_answer": text, "reasoning": "".join(raw["reasoning"]),
                 "tool_calls": [{"id": c["id"], "name": c["name"], "arguments": c["arguments"]} for c in calls],
@@ -490,8 +495,10 @@ def skipped_record(spec: dict, reason: str) -> tuple[dict, dict, dict]:
 class Collector:
     """Runs the scheduled requests in order and keeps their records."""
 
-    def __init__(self, target: Target, corpus: Corpus, model: str | None, log, timeout_s: float):
+    def __init__(self, target: Target, corpus: Corpus, model: str | None, log, timeout_s: float,
+                 sampling: dict = SAMPLING):
         self.target, self.corpus, self.model, self.log, self.timeout_s = target, corpus, model, log, timeout_s
+        self.sampling = sampling
         self.meta = {row["id"]: row for row in corpus.build["requests"]}
         self.results: dict[str, tuple[dict, dict, dict]] = {}
         self.abort: str | None = None
@@ -499,7 +506,7 @@ class Collector:
         self.total = sum(PLANNED[p] for p in ("warmup", "performance", "sanity"))
 
     def finish(self, spec: dict, raw: dict) -> dict:
-        result = record_of(spec, raw, self.meta[spec["id"]])
+        result = record_of(spec, raw, self.meta[spec["id"]], sampling=self.sampling)
         self.results[spec["id"]] = result
         return result[0]
 
@@ -513,7 +520,7 @@ class Collector:
             return
         self.number += 1
         self.log(f"[{self.number}/{self.total}] {spec['id']} (up to {spec['max_output_tokens']} tokens)")
-        raw = stream_chat(self.target, spec, self.model, timeout_s=self.timeout_s)
+        raw = stream_chat(self.target, spec, self.model, timeout_s=self.timeout_s, sampling=self.sampling)
         record = self.finish(spec, raw)
         timing = record["timings"]
         speed = record["metrics"]
@@ -533,7 +540,8 @@ class Collector:
         raws: dict[str, dict] = {}
 
         def work(spec):
-            raws[spec["id"]] = stream_chat(self.target, spec, self.model, timeout_s=self.timeout_s, gate=gate)
+            raws[spec["id"]] = stream_chat(self.target, spec, self.model, timeout_s=self.timeout_s, gate=gate,
+                                           sampling=self.sampling)
         with ThreadPoolExecutor(max_workers=len(specs)) as pool:
             futures = [pool.submit(work, spec) for spec in specs]
             time.sleep(0.05)
@@ -767,12 +775,15 @@ def run(target: Target, out: Path | None, *, out_root: Path | None = None, optio
         corpus: Corpus | None = None, declared: dict | None = None, plan: dict | None = None,
         engine_log: Path | None = None, engine_run_log: tuple[Path | None, int] | None = None, command: str = "strata bench run --suite standard-v1",
         log=lambda message: None, timeout_s: float = REQUEST_TIMEOUT_S, started_engine: bool = False,
-        hash_model: bool = True) -> tuple[dict, Path]:
+        hash_model: bool = True, reasoning_effort: str = "xhigh") -> tuple[dict, Path]:
     """Run the protocol against `target` and write the report into the new directory `out` (or a new folder named
     <date>-standard-<gpu>-<run id> under `out_root`). -> (the result, the folder)."""
     declared = {"track": "custom", "track_notes": "no notes given by the operator", **(declared or {})}
     if declared["track"] not in ("default", "custom"):
         raise ProfileError("--track must be default or custom", 2)
+    if reasoning_effort not in REASONING_EFFORTS:
+        raise ProfileError("--reasoning-effort must be one of " + ", ".join(REASONING_EFFORTS), 2)
+    sampling = {**SAMPLING, "reasoning_effort": reasoning_effort}
     corpus = corpus or load_corpus()
     if out is not None and (out.exists() or out.is_symlink()):
         raise ProfileError("benchmark output directory already exists", 2)
@@ -792,6 +803,9 @@ def run(target: Target, out: Path | None, *, out_root: Path | None = None, optio
     reasons_nonconforming: list[str] = []
     if not target.loopback:
         reasons_nonconforming.append("the server is not on loopback: standard latency is measured over loopback")
+    if sampling != SAMPLING:
+        reasons_nonconforming.append(f"reasoning effort {reasoning_effort} instead of the protocol's "
+                                     f"{SAMPLING['reasoning_effort']} (--reasoning-effort, an operator variant)")
 
     served_model = props.get("model_alias") or status.get("model")
     prior = ((status.get("activity") or {}).get("requests"))
@@ -820,7 +834,7 @@ def run(target: Target, out: Path | None, *, out_root: Path | None = None, optio
     configuration_block, other_options = facts.configuration(
         why, options=options, env=(plan.get("config") or {}).get("env") if isinstance(plan.get("config"), dict) else None,
         props=props, declared=declared,
-        sampling={"sampling": SAMPLING, "chat_template_kwargs": TEMPLATE_KWARGS}, template_ref=template_ref)
+        sampling={"sampling": sampling, "chat_template_kwargs": TEMPLATE_KWARGS}, template_ref=template_ref)
 
     if software_block["strata_commit"] is None:
         reasons_nonconforming.append("the Strata commit is unknown (not a git checkout and no COMMIT file)")
@@ -838,7 +852,7 @@ def run(target: Target, out: Path | None, *, out_root: Path | None = None, optio
         out_root.mkdir(parents=True, exist_ok=True)
     _private_mkdir(out, parents=False, exist_ok=False)
     started_at = _now()
-    collector = Collector(target, corpus, served_model, log, timeout_s)
+    collector = Collector(target, corpus, served_model, log, timeout_s, sampling)
     by_phase = {p: [s for s in corpus.specs if s["phase"] == p] for p in PHASES}
     required_start = time.monotonic()
     interrupted = False

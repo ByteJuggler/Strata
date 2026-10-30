@@ -601,6 +601,21 @@ class RunTests(StandardBase):
         self.assertEqual(doc["run"]["status"], "nonconforming")
         self.assertTrue(any("outside 2%" in r for r in doc["extensions"]["status_reasons"]))
 
+    def test_a_lower_reasoning_effort_is_sent_recorded_and_nonconforming(self):
+        doc, _ = self.run_standard(reasoning_effort="medium")
+        self.assertEqual({b["reasoning_effort"] for b in self.server.bodies}, {"medium"})
+        self.assertEqual({b["temperature"] for b in self.server.bodies}, {1.0})
+        self.assertEqual(doc["configuration"]["sampling"]["reasoning_effort"], "medium")
+        self.assertEqual(doc["run"]["status"], "nonconforming")
+        self.assertTrue(any("reasoning effort medium instead of the protocol's xhigh" in r
+                            for r in doc["extensions"]["status_reasons"]))
+        self.assertEqual(bs.validate(doc), [])
+        self.assertEqual(bs.SAMPLING["reasoning_effort"], "xhigh")
+
+    def test_an_unknown_reasoning_effort_is_refused(self):
+        with self.assertRaises(ProfileError):
+            self.run_standard(reasoning_effort="max")
+
     def test_a_refused_setting_is_nonconforming(self):
         self.server.script["warmup"] = {"http": 400}
         doc, _ = self.run_standard()
