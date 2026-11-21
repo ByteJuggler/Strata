@@ -83,6 +83,10 @@ substitute greedy sampling or disable thinking. Output caps and fixed seeds belo
 not claims to use Qwen's full recommended output allowance. A fixed seed does not guarantee identical outputs
 across hardware or engine versions.
 
+`strata bench run --reasoning-effort low|medium|high` sends a lower effort instead of `xhigh` and changes nothing
+else. It answers a different question (what a lower effort costs and saves), so such a run is always marked
+nonconforming, its result records the effort it sent, and it is not compared with standard results as one of them.
+
 Use one installed configuration per run. Record effective context, KV and expert cache settings, offloading,
 prefill, MTP, calibration, experimental options, and server capacity. Use `configuration.track = "default"` for
 an unmodified release's setup-generated settings; identify the release and setup choices. Use `"custom"` for
